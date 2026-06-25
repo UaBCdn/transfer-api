@@ -829,12 +829,27 @@ function upstreamApiKey(request, env) {
 }
 
 function optionalUpstreamApiKey(request, env) {
-  const configured = env.UNLIMITED_SURF_API_KEY || env.API_KEY || env.AUTH_KEY;
-  if (configured) return configured;
+  return getUpstreamApiKey(env);
+}
 
-  if (env.WORKER_API_KEY) return "";
+function getUpstreamApiKey(env) {
+  const keyStr = env.UNLIMITED_SURF_API_KEY || env.API_KEY || env.AUTH_KEY;
+  if (!keyStr) {
+    if (env.WORKER_API_KEY) return "";
+    return clientApiKey(request);
+  }
 
-  return clientApiKey(request);
+  // 支持逗号分隔的多 key
+  const keys = keyStr.split(',').map(k => k.trim()).filter(k => k);
+  if (keys.length === 0) {
+    if (env.WORKER_API_KEY) return "";
+    return clientApiKey(request);
+  }
+  if (keys.length === 1) return keys[0];
+
+  // Round-robin 轮询：使用当前时间戳的简单算法选择 key
+  const index = Math.floor(Date.now() / 1000) % keys.length;
+  return keys[index];
 }
 
 function validateWorkerApiKey(request, env) {

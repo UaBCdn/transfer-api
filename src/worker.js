@@ -829,25 +829,20 @@ function upstreamApiKey(request, env) {
 }
 
 function optionalUpstreamApiKey(request, env) {
-  return getUpstreamApiKey(env);
+  const configured = getUpstreamApiKey(env);
+  if (configured) return configured;
+  if (env.WORKER_API_KEY) return "";
+  return clientApiKey(request);
 }
 
 function getUpstreamApiKey(env) {
   const keyStr = env.UNLIMITED_SURF_API_KEY || env.API_KEY || env.AUTH_KEY;
-  if (!keyStr) {
-    if (env.WORKER_API_KEY) return "";
-    return clientApiKey(request);
-  }
+  if (!keyStr) return null;
 
-  // 支持逗号分隔的多 key
-  const keys = keyStr.split(',').map(k => k.trim()).filter(k => k);
-  if (keys.length === 0) {
-    if (env.WORKER_API_KEY) return "";
-    return clientApiKey(request);
-  }
+  const keys = keyStr.split(/[\n,]+/).map(k => k.trim()).filter(k => k);
+  if (keys.length === 0) return null;
   if (keys.length === 1) return keys[0];
 
-  // Round-robin 轮询：使用当前时间戳的简单算法选择 key
   const index = Math.floor(Date.now() / 1000) % keys.length;
   return keys[index];
 }

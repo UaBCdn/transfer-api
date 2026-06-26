@@ -52,7 +52,10 @@ export default {
 
       return errorResponse(404, "not_found", `No route for ${path}`);
     } catch (error) {
-      return errorResponse(500, "internal_error", error && error.message ? error.message : String(error));
+      const status = error && error.status ? error.status : 500;
+      const code = error && error.code ? error.code : "internal_error";
+      const message = error && error.message ? error.message : String(error);
+      return errorResponse(status, code, message);
     }
   },
 };
@@ -123,7 +126,7 @@ async function openAIDirectCapability(request, env, body, route) {
 
   if (body.stream !== false) {
     const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(streamOpenAIChat(upstream, { id, created, model }));
+    return sseResponse(streamOpenAIChat(upstream, { id, created, model, inputText: payload.message || payload.query || "" }));
   }
 
   const result = await collectUnlimitedText(request, env, route, payload);
@@ -154,7 +157,7 @@ async function openAIChatCompletions(request, env, body) {
 
   if (body.stream) {
     const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(streamOpenAIChat(upstream, { id, created, model }));
+    return sseResponse(streamOpenAIChat(upstream, { id, created, model, inputText: payload.message || "" }));
   }
 
   const result = await collectUnlimitedText(request, env, route, payload);
@@ -186,7 +189,7 @@ async function openAIResponses(request, env, body) {
 
   if (body.stream) {
     const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(streamOpenAIResponses(upstream, { id, created, model }));
+    return sseResponse(streamOpenAIResponses(upstream, { id, created, model, inputText: payload.message || "" }));
   }
 
   const result = await collectUnlimitedText(request, env, route, payload);
@@ -269,7 +272,7 @@ async function anthropicDirectCapability(request, env, body, route) {
 
   if (body.stream !== false) {
     const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(streamAnthropicMessages(upstream, { id, model: requestedModel }));
+    return sseResponse(streamAnthropicMessages(upstream, { id, model: requestedModel, inputText: payload.message || payload.query || "" }));
   }
 
   const result = await collectUnlimitedText(request, env, route, payload);
@@ -293,7 +296,7 @@ async function anthropicMessages(request, env, body) {
 
   if (body.stream) {
     const upstream = await callUnlimitedStream(request, env, route, payload);
-    return sseResponse(streamAnthropicMessages(upstream, { id, model: requestedModel }));
+    return sseResponse(streamAnthropicMessages(upstream, { id, model: requestedModel, inputText: payload.message || "" }));
   }
 
   const result = await collectUnlimitedText(request, env, route, payload);
@@ -443,7 +446,13 @@ async function proxyUpstream(request, env, path) {
   const upstreamUrl = new URL(path + new URL(request.url).search, upstreamBase(env));
   const headers = new Headers(request.headers);
   const key = optionalUpstreamApiKey(request, env);
-  if (key) headers.set("authorization", `Bearer ${key}`);
+
+  if (key) {
+    headers.set("authorization", `Bearer ${key}`);
+  } else if (env.WORKER_API_KEY) {
+    headers.delete("authorization");
+    headers.delete("x-api-key");
+  }
   headers.delete("host");
 
   const init = {
@@ -465,10 +474,14 @@ async function callUnlimitedJson(request, env, path, payload) {
   });
 
   if (!response.ok) {
-    throw new Error(`upstream ${path} failed: ${response.status} ${await response.text()}`);
+    const detail = await response.text().catch(() => "");
+    const err = new Error(`Upstream ${path} failed: ${response.status} ${detail.slice(0, 500)}`);
+    err.status = response.status >= 400 && response.status < 600 ? response.status : 502;
+    err.code = "upstream_error";
+    throw err;
   }
 
-  return response.json();
+  return response.json().catch(() => ({}));
 }
 
 async function callUnlimitedStream(request, env, path, payload) {
@@ -479,7 +492,11 @@ async function callUnlimitedStream(request, env, path, payload) {
   });
 
   if (!response.ok) {
-    throw new Error(`upstream ${path} failed: ${response.status} ${await response.text()}`);
+    const detail = await response.text().catch(() => "");
+    const err = new Error(`Upstream ${path} failed: ${response.status} ${detail.slice(0, 500)}`);
+    err.status = response.status >= 400 && response.status < 600 ? response.status : 502;
+    err.code = "upstream_error";
+    throw err;
   }
 
   return response;
@@ -541,13 +558,20 @@ function streamOpenAIChat(upstream, meta) {
         choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
       });
     },
-    finish(controller, reason) {
+    finish(controller, reason, extra) {
+      const completionTokens = estimateTokens((extra && extra.fullText) || "");
+      const promptTokens = estimateTokens(meta.inputText || "");
       writeSse(controller, {
         id: meta.id,
         object: "chat.completion.chunk",
         created: meta.created,
         model: meta.model,
         choices: [{ index: 0, delta: {}, finish_reason: openAIStopReason(reason) }],
+        usage: {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+        },
       });
       writeRawSse(controller, "data: [DONE]\n\n");
     },
@@ -591,25 +615,32 @@ function streamOpenAIResponses(upstream, meta) {
         delta: text,
       });
     },
-    finish(controller) {
+    finish(controller, reason, extra) {
+      const fullText = (extra && extra.fullText) || "";
       writeSseEvent(controller, "response.output_text.done", {
         type: "response.output_text.done",
         item_id: outputId,
         output_index: 0,
         content_index: 0,
-        text: "",
+        text: fullText,
       });
       writeSseEvent(controller, "response.content_part.done", {
         type: "response.content_part.done",
         item_id: outputId,
         output_index: 0,
         content_index: 0,
-        part: { type: "output_text", text: "", annotations: [] },
+        part: { type: "output_text", text: fullText, annotations: [] },
       });
       writeSseEvent(controller, "response.output_item.done", {
         type: "response.output_item.done",
         output_index: 0,
-        item: { id: outputId, type: "message", status: "completed", role: "assistant", content: [] },
+        item: {
+          id: outputId,
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: fullText, annotations: [] }],
+        },
       });
       writeSseEvent(controller, "response.completed", {
         type: "response.completed",
@@ -633,7 +664,7 @@ function streamAnthropicMessages(upstream, meta) {
           content: [],
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
+          usage: { input_tokens: estimateTokens(meta.inputText || ""), output_tokens: 0 },
         },
       });
       writeSseEvent(controller, "content_block_start", {
@@ -649,12 +680,13 @@ function streamAnthropicMessages(upstream, meta) {
         delta: { type: "text_delta", text },
       });
     },
-    finish(controller, reason) {
+    finish(controller, reason, extra) {
+      const outputTokens = estimateTokens((extra && extra.fullText) || "");
       writeSseEvent(controller, "content_block_stop", { type: "content_block_stop", index: 0 });
       writeSseEvent(controller, "message_delta", {
         type: "message_delta",
         delta: { stop_reason: anthropicStopReason(reason), stop_sequence: null },
-        usage: { output_tokens: 0 },
+        usage: { output_tokens: outputTokens },
       });
       writeSseEvent(controller, "message_stop", { type: "message_stop" });
     },
@@ -668,6 +700,7 @@ function streamUnlimitedEvents(upstream, handlers) {
   return new ReadableStream({
     async start(controller) {
       let finished = false;
+      let accumulatedText = "";
       handlers.start && handlers.start(controller);
 
       try {
@@ -687,17 +720,18 @@ function streamUnlimitedEvents(upstream, handlers) {
             if (!parsed) continue;
 
             if (typeof parsed.delta === "string" && parsed.delta.length) {
+              accumulatedText += parsed.delta;
               handlers.delta && handlers.delta(controller, parsed.delta, parsed);
             }
 
             if (parsed.finish || parsed.done) {
               finished = true;
-              handlers.finish && handlers.finish(controller, parsed.reason || "stop", parsed);
+              handlers.finish && handlers.finish(controller, parsed.reason || "stop", { ...parsed, fullText: accumulatedText });
             }
           }
         }
 
-        if (!finished) handlers.finish && handlers.finish(controller, "stop", {});
+        if (!finished) handlers.finish && handlers.finish(controller, "stop", { fullText: accumulatedText });
       } catch (error) {
         controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: error.message || String(error) })}\n\n`));
       } finally {
@@ -799,13 +833,15 @@ function addCors(response) {
 }
 
 async function readJson(request) {
-  if (!request.body) return {};
   const text = await request.text();
-  if (!text.trim()) return {};
+  if (!text || !text.trim()) return {};
   try {
     return JSON.parse(text);
-  } catch (_) {
-    throw new Error("Request body must be valid JSON.");
+  } catch (error) {
+    const err = new Error("Request body is not valid JSON.");
+    err.status = 400;
+    err.code = "invalid_request_error";
+    throw err;
   }
 }
 
@@ -829,22 +865,12 @@ function upstreamApiKey(request, env) {
 }
 
 function optionalUpstreamApiKey(request, env) {
-  const configured = getUpstreamApiKey(env);
+  const configured = env.UNLIMITED_SURF_API_KEY || env.API_KEY || env.AUTH_KEY;
   if (configured) return configured;
-  if (env.WORKER_API_KEY) return "";
-  return clientApiKey(request);
-}
 
-function getUpstreamApiKey(env) {
-  const keyStr = env.UNLIMITED_SURF_API_KEY || env.API_KEY || env.AUTH_KEY;
-  if (!keyStr) return null;
+  if (env.WORKER_API_KEY) return null;
 
-  const keys = keyStr.split(/[\n,]+/).map(k => k.trim()).filter(k => k);
-  if (keys.length === 0) return null;
-  if (keys.length === 1) return keys[0];
-
-  const index = Math.floor(Date.now() / 1000) % keys.length;
-  return keys[index];
+  return clientApiKey(request) || null;
 }
 
 function validateWorkerApiKey(request, env) {
@@ -957,8 +983,13 @@ function latestUserText(messages) {
 function hasWebSearchTool(tools) {
   if (!Array.isArray(tools)) return false;
   return tools.some((tool) => {
-    const type = tool && (tool.type || tool.name || (tool.function && tool.function.name));
-    return /web.?search|browser|search/i.test(String(type || ""));
+    const type = String((tool && (tool.type || tool.name)) || "").toLowerCase();
+    return (
+      type === "web_search" ||
+      type === "web_search_preview" ||
+      type === "web_search_2025_03_11" ||
+      type.startsWith("web_search_")
+    );
   });
 }
 
@@ -1079,7 +1110,7 @@ function bytesToBase64(bytes) {
 }
 
 function looksLikeAnthropicRequest(request) {
-  return request.headers.has("anthropic-version") || request.headers.has("anthropic-beta") || request.headers.has("x-api-key");
+  return request.headers.has("anthropic-version") || request.headers.has("anthropic-beta");
 }
 
 function serviceInfo(request, env) {

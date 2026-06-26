@@ -1,4 +1,4 @@
-name = "transfer-api"
+name = "uls03"
 main = "src/worker.js"
 compatibility_date = "2025-11-21"
 
